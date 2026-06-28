@@ -4,6 +4,7 @@ import threading
 import subprocess
 import shutil
 import glob
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 from io import BytesIO
@@ -28,6 +29,138 @@ except ImportError:
     print("⚠️ 警告: 未检测到库，【调色盘】功能将不可用。")
 
 
+class PatcherError(RuntimeError):
+    pass
+
+
+TEMP_DIR_PREFIX = "dnf_prism_"
+TEMP_MARKER_FILE = ".dnf_palette_prism_temp"
+
+
+def _is_ascii_path(path):
+    try:
+        os.fspath(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _ensure_writable_dir(path):
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, ".write_test")
+    with open(probe, "wb") as f:
+        f.write(b"ok")
+    os.remove(probe)
+
+
+def _ascii_temp_parent_candidates():
+    candidates = [
+        os.environ.get("TEMP"),
+        os.environ.get("TMP"),
+        tempfile.gettempdir(),
+    ]
+    public_dir = os.environ.get("PUBLIC")
+    if public_dir:
+        candidates.append(os.path.join(public_dir, "DNFPalettePrismTemp"))
+    system_drive = os.environ.get("SystemDrive")
+    if system_drive:
+        candidates.append(os.path.join(system_drive + os.sep, "DNFPalettePrismTemp"))
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.abspath(candidate)
+        if not _is_ascii_path(candidate):
+            continue
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
+
+
+def _get_ascii_temp_parent():
+    for candidate in _ascii_temp_parent_candidates():
+        try:
+            _ensure_writable_dir(candidate)
+            return candidate
+        except Exception:
+            continue
+
+    raise RuntimeError("未找到可写的英文临时目录，NpkPatcher 无法在中文路径下合成 IMG。")
+
+
+def _make_ascii_temp_root(pid):
+    temp_root = tempfile.mkdtemp(prefix=f"{TEMP_DIR_PREFIX}{pid}_", dir=_get_ascii_temp_parent())
+    try:
+        with open(os.path.join(temp_root, TEMP_MARKER_FILE), "w", encoding="ascii") as marker:
+            marker.write("owned by DNF Palette Prism\n")
+    except Exception:
+        try:
+            os.rmdir(temp_root)
+        except Exception:
+            pass
+        raise
+    return temp_root
+
+
+def _is_path_inside(path, parent):
+    try:
+        real_path = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        real_parent = os.path.normcase(os.path.realpath(os.path.abspath(parent)))
+        return os.path.commonpath([real_path, real_parent]) == real_parent and real_path != real_parent
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_remove_temp_root(temp_root):
+    if not temp_root:
+        return False
+
+    temp_root = os.path.abspath(os.fspath(temp_root))
+    if not os.path.isdir(temp_root):
+        return False
+
+    dirname = os.path.basename(os.path.normpath(temp_root))
+    if not dirname.startswith(TEMP_DIR_PREFIX):
+        return False
+
+    marker_path = os.path.join(temp_root, TEMP_MARKER_FILE)
+    if not os.path.isfile(marker_path):
+        return False
+
+    if not any(_is_path_inside(temp_root, parent) for parent in _ascii_temp_parent_candidates()):
+        return False
+
+    shutil.rmtree(temp_root)
+    return True
+
+
+def _safe_ascii_name(name, fallback):
+    safe = []
+    for ch in os.path.basename(name.replace("\\", "/")):
+        if ch.isascii() and (ch.isalnum() or ch in "._-"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    result = "".join(safe).strip("._")
+    return result or fallback
+
+
+def _decode_patcher_output(data):
+    if not data:
+        return ""
+    for encoding in ("gbk", "utf-8", "mbcs"):
+        try:
+            return data.decode(encoding, errors="replace").strip()
+        except LookupError:
+            continue
+    return repr(data)
+
+
 # =========================================================================
 # 【新增】独立的多进程工作函数 (必须放在类外面)
 # =========================================================================
@@ -36,6 +169,7 @@ def process_one_npk_task(task_data):
     单个 NPK 处理任务，将在子进程中运行。
     task_data 包含所有需要的参数 (避免传递 self)
     """
+    temp_root = None
     try:
         # 1. 解包参数
         (npk_path, out_dir, patcher_exe, 
@@ -46,10 +180,8 @@ def process_one_npk_task(task_data):
         fname = os.path.basename(npk_path)
         pid = os.getpid() # 获取当前进程ID
         
-        # 为每个进程创建独立的临时目录，避免冲突
-        temp_root = os.path.join(os.getcwd(), f"_temp_proc_{pid}")
-        if os.path.exists(temp_root): shutil.rmtree(temp_root)
-        os.makedirs(temp_root)
+        # NpkPatcher 对中文工作目录和 CSV 图片路径不稳定，统一放到 ASCII 临时目录。
+        temp_root = _make_ascii_temp_root(pid)
 
         # 加载自定义贴图 (因为Image对象不能跨进程传递，所以传路径在子进程重新加载)
         custom_tex_img = None
@@ -71,8 +203,8 @@ def process_one_npk_task(task_data):
             npk.load_all()
             valid_imgs = [x for x in npk.files if x.name.lower().endswith('.img')]
             
-            for file_in in valid_imgs:
-                sname = file_in.name.replace("/", "_")
+            for img_index, file_in in enumerate(valid_imgs):
+                sname = _safe_ascii_name(file_in.name, f"img_{img_index}")
                 wdir = os.path.join(temp_root, sname)
                 os.makedirs(wdir, exist_ok=True)
                 
@@ -140,12 +272,19 @@ def process_one_npk_task(task_data):
                             capture_output=True, 
                             startupinfo=si
                         )
-                        
-                        if sub.returncode == 0 and os.path.exists(i_path):
-                            with open(i_path, 'rb') as nf: file_in.set_data(nf.read())
-                            mod_cnt += 1
+
+                        if sub.returncode != 0:
+                            detail = _decode_patcher_output(sub.stderr) or _decode_patcher_output(sub.stdout)
+                            raise PatcherError(f"NpkPatcher 合成失败 (错误码: {sub.returncode}) {detail}".strip())
+                        if not os.path.exists(i_path):
+                            raise PatcherError("NpkPatcher 合成失败：未生成 new.img")
+
+                        with open(i_path, 'rb') as nf: file_in.set_data(nf.read())
+                        mod_cnt += 1
                             
                 except Exception as img_err:
+                    if isinstance(img_err, PatcherError):
+                        raise
                     print(f"[{pid}] IMG Error: {img_err}")
                     pass # 继续下一个 img
                 
@@ -159,14 +298,16 @@ def process_one_npk_task(task_data):
                 with open(dst, 'wb') as fo: npk.save(fo)
                 
         # 任务结束，清理整个临时目录
-        try: shutil.rmtree(temp_root)
+        try:
+            _safe_remove_temp_root(temp_root)
         except: pass
         
         return (True, f"完成: {fname} (修改 {mod_cnt} 个文件)")
 
     except Exception as e:
         # 出错也要尝试清理
-        try: shutil.rmtree(temp_root)
+        try:
+            _safe_remove_temp_root(temp_root)
         except: pass
         return (False, f"失败: {os.path.basename(npk_path)} -> {str(e)}")
 
